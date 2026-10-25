@@ -7,10 +7,10 @@ import seaborn as sns
 from scipy.ndimage import gaussian_filter1d
 from scipy.stats import pearsonr
 
-BASE = r"H:\Exp_Ein_Hamifratz\output_111026"
-SIGNAL_PATH = BASE + r"\combined_0.001.parquet"
-FEED_PATH = BASE + r"\feeding_times_ch5.parquet"
-OUT_DIR = r"H:\Exp_Ein_Hamifratz\feeding_features"
+BASE = "/Volumes/My Book/exp_1/sw"
+SIGNAL_PATH = f"{BASE}/thr_0.01.parquet"
+FEED_PATH = f"{BASE}/feeding_times_exp1.parquet"
+OUT_DIR = f"{BASE}/feeding_features"
 CHANNELS = [f"Ch{i}" for i in range(1, 7)]
 N_PANELS = 30
 NCOLS = 6
@@ -18,32 +18,28 @@ N_CURVE_PNGS = 4
 
 CORR_HIGHLIGHT = 0.80
 ALPHA = 0.05
-MINUTES_PER_DAY = 24 * 60
 
-# Appendix remaining features only (paper name, group, code column).
+# Landmark search only. The series is sampled every 6 s, so a 2-sample
+# Gaussian still follows bumps a minute or two wide. About 1.5 minutes
+# drops those wiggles without dragging the flanks across the baseline.
+DETECT_SMOOTH_MINUTES = 1.5
+DETECT_SLOPE_SMOOTH_MINUTES = 1.5
+# Keep a flank while its slope is still this fraction of the steepest
+# rise or fall. A weaker stretch shorter than FLANK_RESUME_MINUTES is a
+# local bump and is skipped when the steep slope comes back.
+FLANK_SLOPE_FRACTION = 0.15
+FLANK_RESUME_MINUTES = 3.0
+
+# Chosen in features_kept.parquet (paper name, group, code column).
 APPENDIX_FEATURES = [
-    ("Response onset", "Temporal", "mountain_start"),
-    ("Response duration", "Temporal", "mountain_duration"),
-    ("FWHM", "Temporal", "FWHM"),
-    ("Plateau-rise duration", "Temporal", "plateau_rise_duration"),
     ("Baseline", "Magnitude", "baseline"),
     ("Peak height", "Magnitude", "peak_height"),
-    ("Plateau-rise change", "Magnitude", "plateau_rise_change"),
-    ("Plateau-fall change", "Magnitude", "plateau_fall_change"),
-    ("Plateau gradient", "Gradient", "plateau_gradient"),
-    ("Plateau-gradient R2", "Gradient", "plateau_gradient_R2"),
     ("Plateau-rise gradient", "Gradient", "plateau_rise_gradient"),
-    ("Plateau-rise-gradient R2", "Gradient", "plateau_rise_gradient_R2"),
-    ("Maximum plateau-rise gradient", "Gradient", "max_plateau_rise_gradient"),
-    ("Plateau-fall-gradient R2", "Gradient", "plateau_fall_gradient_R2"),
-    ("Rise AUC", "Area", "rise_AUC"),
-    ("Plateau-rise AUC", "Area", "plateau_rise_AUC"),
-    ("Fall AUC fraction", "Area", "fall_AUC_fraction"),
-    ("Plateau standard deviation", "Variability", "plateau_std"),
-    ("Symmetry ratio", "Variability", "symmetry_ratio"),
+    ("Plateau-fall gradient", "Gradient", "plateau_fall_gradient"),
     ("Rise-to-fall gradient ratio", "Variability", "rise_fall_gradient_ratio"),
-    ("Feeding sine", "Feeding time", "feeding_sin"),
-    ("Feeding cosine", "Feeding time", "feeding_cos"),
+    ("Rise AUC", "Area", "rise_AUC"),
+    ("Fall AUC", "Area", "fall_AUC"),
+    ("Rise-to-fall AUC ratio", "Area", "rise_fall_AUC_ratio"),
 ]
 
 
@@ -52,13 +48,20 @@ def to_datetime(series):
 
 
 def minmax_channel(values):
-    """Scale one channel to 0-1 using its own full-series min and max."""
+    """Scale one channel to 0-1 inside its own recording.
+
+    The ends are the 0.5th and 99.9th percentiles, then the result is
+    clipped. A short spike cannot set the top of the scale.
+    """
     values = np.asarray(values, dtype=float)
-    ymin = np.nanmin(values)
-    ymax = np.nanmax(values)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return np.zeros_like(values, dtype=float)
+    ymin = float(np.percentile(finite, 0.5))
+    ymax = float(np.percentile(finite, 99.9))
     if not np.isfinite(ymin) or not np.isfinite(ymax) or ymax <= ymin:
         return np.zeros_like(values, dtype=float)
-    return (values - ymin) / (ymax - ymin)
+    return np.clip((values - ymin) / (ymax - ymin), 0.0, 1.0)
 
 
 def preview_positions(n, n_panels=N_PANELS):
@@ -72,6 +75,15 @@ def slice_window(times, values, ft):
     lo = np.searchsorted(times, start, side="left")
     hi = np.searchsorted(times, end, side="right")
     return times[lo:hi], values[lo:hi]
+
+
+def samples_per_minutes(times, minutes):
+    """Gaussian sigma, in samples, for a width given in minutes."""
+    step_ns = np.median(np.diff(times).astype("timedelta64[ns]").astype(float))
+    step_sec = step_ns / 1e9
+    if not np.isfinite(step_sec) or step_sec <= 0:
+        step_sec = 6.0
+    return max(1.0, minutes * 60.0 / step_sec)
 
 
 def window_frame(times, values, ft):
@@ -91,6 +103,7 @@ def extract_mountain_features(
     ax=None,
     show_stage_markers=True,
     show_guide_lines=True,
+    preview=False,
 ):
     y = df_window[value_col].to_numpy(dtype=float)
     y = pd.Series(y).interpolate().bfill().ffill().to_numpy()
@@ -100,26 +113,28 @@ def extract_mountain_features(
     if len(y) < 5:
         return {}
 
-    y_smooth = gaussian_filter1d(y, sigma=2)
+    y_smooth = gaussian_filter1d(
+        y, sigma=samples_per_minutes(x, DETECT_SMOOTH_MINUTES)
+    )
 
-    # Baseline
+    # Thresholds for locating landmarks only. Feature values are
+    # recomputed from the raw series after the indices are known.
     n_base = max(3, int(0.05 * len(y)))
-    baseline = min(
+    search_baseline = min(
         np.mean(y_smooth[:n_base]),
         np.mean(y_smooth[-n_base:])
     )
 
-    # Peak
     peak_index = int(np.argmax(y_smooth))
-    peak_height = float(y[peak_index])
-    amplitude = peak_height - baseline
+    search_peak = float(y_smooth[peak_index])
+    search_amplitude = search_peak - search_baseline
 
-    if amplitude <= 0:
+    if search_amplitude <= 0:
         return {}
 
-    half_level = baseline + 0.50 * amplitude
-    plateau_level = baseline + plateau_threshold * amplitude
-    toe_level = baseline + toe_fraction * amplitude
+    half_level = search_baseline + 0.50 * search_amplitude
+    plateau_level = search_baseline + plateau_threshold * search_amplitude
+    toe_level = search_baseline + toe_fraction * search_amplitude
 
     # Plateau first (anchors the mountain core)
     rise_90 = np.where(y_smooth[: peak_index + 1] >= plateau_level)[0]
@@ -132,28 +147,53 @@ def extract_mountain_features(
         else len(y) - 1
     )
 
-    # Flanks: expand from dominant rise/fall slopes while slope keeps
-    # the same sign, but stop at the mountain toe so baseline tails
-    # are not included.
-    dy = gaussian_filter1d(np.gradient(y_smooth), sigma=1.5)
+    # Flanks expand from the steepest rise and fall. A brief weaker
+    # stretch is a local bump and does not end the curve. The fall is
+    # done once it stays weak, even when that level is higher than the
+    # start of the window.
+    dy = gaussian_filter1d(
+        np.gradient(y_smooth),
+        sigma=samples_per_minutes(x, DETECT_SLOPE_SMOOTH_MINUTES),
+    )
 
     i_rise = int(np.argmax(dy[: peak_index + 1]))
     i_fall = peak_index + int(np.argmin(dy[peak_index:]))
 
-    rise_eps = slope_fraction * dy[i_rise] if dy[i_rise] > 0 else 0.0
-    fall_eps = slope_fraction * dy[i_fall] if dy[i_fall] < 0 else 0.0
+    keep = slope_fraction if slope_fraction > 0 else FLANK_SLOPE_FRACTION
+    rise_eps = keep * dy[i_rise] if dy[i_rise] > 0 else 0.0
+    fall_eps = keep * dy[i_fall] if dy[i_fall] < 0 else 0.0
+    resume_n = max(3, int(round(samples_per_minutes(x, FLANK_RESUME_MINUTES))))
 
-    mountain_start = i_rise
-    while mountain_start > 0 and dy[mountain_start - 1] > rise_eps:
-        mountain_start -= 1
-        if y_smooth[mountain_start] <= toe_level:
-            break
+    def walk_rise(origin):
+        i = origin
+        while i > 0:
+            if y_smooth[i] <= toe_level:
+                break
+            if dy[i - 1] > rise_eps:
+                i -= 1
+                continue
+            lo = max(0, i - resume_n)
+            earlier = np.where(dy[lo:i] > rise_eps)[0]
+            if len(earlier) == 0:
+                break
+            i = lo + int(earlier[-1])
+        return i
 
-    mountain_end = i_fall
-    while mountain_end < len(y) - 1 and dy[mountain_end] < fall_eps:
-        mountain_end += 1
-        if y_smooth[mountain_end] <= toe_level:
-            break
+    def walk_fall(origin):
+        i = origin
+        n = len(dy)
+        while i < n - 1:
+            if dy[i] < fall_eps:
+                i += 1
+                continue
+            later = np.where(dy[i + 1:i + 1 + resume_n] < fall_eps)[0]
+            if len(later) == 0:
+                break
+            i = i + 1 + int(later[0])
+        return i
+
+    mountain_start = walk_rise(i_rise)
+    mountain_end = walk_fall(i_fall)
 
     mountain_start = min(mountain_start, plateau_start)
     mountain_end = max(mountain_end, plateau_end)
@@ -184,6 +224,15 @@ def extract_mountain_features(
         if np.isfinite(half_start) and np.isfinite(half_end)
         else np.nan
     )
+
+    baseline = min(
+        np.mean(y[:n_base]),
+        np.mean(y[-n_base:])
+    )
+    peak_height = float(y[peak_index])
+    amplitude = peak_height - baseline
+    if amplitude <= 0:
+        return {}
 
     def fit_gradient(start, end):
         if end <= start:
@@ -313,6 +362,12 @@ def extract_mountain_features(
         else np.nan
     )
 
+    rise_fall_auc_ratio = (
+        rise_auc / fall_auc
+        if np.isfinite(fall_auc) and fall_auc > 0
+        else np.nan
+    )
+
     plateau_fraction = (
         plateau_duration / mountain_duration
         if mountain_duration > 0
@@ -393,7 +448,8 @@ def extract_mountain_features(
         # Shape ratios
         "symmetry_ratio": symmetry_ratio,
         "rise_fall_gradient_ratio":
-            rise_fall_gradient_ratio
+            rise_fall_gradient_ratio,
+        "rise_fall_AUC_ratio": rise_fall_auc_ratio,
     }
 
     # Plot
@@ -401,6 +457,40 @@ def extract_mountain_features(
         minutes = (
             pd.to_datetime(x) - pd.to_datetime(x[0])
         ).total_seconds() / 60
+
+        if preview:
+            ax.plot(
+                minutes, y, color="0.15", linewidth=1.1, alpha=0.95, label="Signal"
+            )
+            ax.plot(
+                minutes, y_smooth, color="C4", linewidth=1.4, label="Smoothed"
+            )
+            ax.axvspan(
+                minutes[mountain_start],
+                minutes[mountain_end],
+                color="C2",
+                alpha=0.18,
+                label="Found curve",
+            )
+            ax.scatter(
+                minutes[mountain_start],
+                y_smooth[mountain_start],
+                marker="v",
+                s=36,
+                color="C0",
+                zorder=6,
+                label="Start",
+            )
+            ax.scatter(
+                minutes[mountain_end],
+                y_smooth[mountain_end],
+                marker="X",
+                s=36,
+                color="C1",
+                zorder=6,
+                label="End",
+            )
+            return features
 
         ax.plot(
             minutes,
@@ -498,14 +588,7 @@ def extract_mountain_features(
 
 def remaining_feature_frame(features_df):
     """Appendix remaining features only, using paper names as columns."""
-    out = features_df.copy()
-    if "feeding_datetime" in out.columns:
-        ts = pd.to_datetime(out["feeding_datetime"])
-        minutes = ts.dt.hour * 60 + ts.dt.minute + ts.dt.second / 60.0
-        angle = 2.0 * np.pi * minutes / MINUTES_PER_DAY
-        out["feeding_sin"] = np.sin(angle)
-        out["feeding_cos"] = np.cos(angle)
-
+    out = features_df
     wanted = [col for _, _, col in APPENDIX_FEATURES]
     missing_cols = [c for c in wanted if c not in out.columns]
     present = [c for c in wanted if c in out.columns]
@@ -921,7 +1004,9 @@ def plot_normalized_windows(times, values, feed_times, channel):
     return fig
 
 
-def plot_feature_overlays(times, values, feed_times, channel, title=None):
+def plot_feature_overlays(
+    times, values, feed_times, channel, title=None, preview=False
+):
     n = len(feed_times)
     nrows = int(np.ceil(n / NCOLS))
     fig, axes = plt.subplots(
@@ -952,6 +1037,7 @@ def plot_feature_overlays(times, values, feed_times, channel, title=None):
             time_col="time",
             plateau_threshold=0.90,
             ax=ax,
+            preview=preview,
         )
         if not features:
             n_fail += 1
@@ -984,10 +1070,16 @@ def plot_feature_overlays(times, values, feed_times, channel, title=None):
 APPENDIX_COLS = [col for _, _, col in APPENDIX_FEATURES]
 
 
-def extract_channel_rows(channel, times, values, feed_times):
-    """One row per feeding. Failed windows keep the row and leave features empty."""
+def extract_channel_rows(channel, times, values, feed_times, feed_labels=None):
+    """One row per feeding. Failed windows keep the row and leave features empty.
+
+    `feed_times` locate the window on the signal clock. `feed_labels` are the
+    corrected feeding times stored with the row.
+    """
+    if feed_labels is None:
+        feed_labels = feed_times
     rows = []
-    for ft in feed_times:
+    for ft, label in zip(feed_times, feed_labels):
         df_window = window_frame(times, values, ft)
         features = {}
         if not df_window.empty:
@@ -999,24 +1091,42 @@ def extract_channel_rows(channel, times, values, feed_times):
             )
         row = {
             "channel": channel,
-            "feeding_datetime": pd.Timestamp(ft),
+            "feeding_datetime": pd.Timestamp(label),
         }
         for col in APPENDIX_COLS:
-            if col in ("feeding_sin", "feeding_cos"):
-                continue
             row[col] = features.get(col, np.nan) if features else np.nan
         rows.append(row)
     return pd.DataFrame(rows)
 
 
 def add_feeding_time_features(features_df):
-    ts = pd.to_datetime(features_df["feeding_datetime"])
-    minutes = ts.dt.hour * 60 + ts.dt.minute + ts.dt.second / 60.0
-    angle = 2.0 * np.pi * minutes / MINUTES_PER_DAY
-    out = features_df.copy()
-    out["feeding_sin"] = np.sin(angle)
-    out["feeding_cos"] = np.cos(angle)
-    return out[["channel", "feeding_datetime", *APPENDIX_COLS]]
+    return features_df[["channel", "feeding_datetime", *APPENDIX_COLS]]
+
+
+def show_smoothed_previews(channel, times, values, feed_times):
+    """Open every feeding window so the smoothed curve and found span can be checked."""
+    parts = np.array_split(np.arange(len(feed_times)), N_CURVE_PNGS)
+    n_fail = 0
+    for part_i, idx in enumerate(parts, start=1):
+        if len(idx) == 0:
+            continue
+        subset = feed_times.iloc[idx]
+        first = int(idx[0]) + 1
+        last = int(idx[-1]) + 1
+        fig, part_fail = plot_feature_overlays(
+            times,
+            values,
+            subset,
+            channel,
+            title=(
+                f"{channel} smoothed curves {first}-{last} "
+                f"(green = found curve)"
+            ),
+            preview=True,
+        )
+        n_fail += part_fail
+        print(f"{channel} preview {part_i}: curves {first}-{last}")
+    return n_fail
 
 
 def save_curve_pngs(channel, times, values, feed_times, out_dir):
@@ -1040,21 +1150,36 @@ def save_curve_pngs(channel, times, values, feed_times, out_dir):
 
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
-    signal = pd.read_parquet(SIGNAL_PATH, columns=[*CHANNELS, "real time"])
-    signal["t"] = to_datetime(signal["real time"])
-    signal = signal.sort_values("t")
+    signal = pd.read_parquet(SIGNAL_PATH, columns=[*CHANNELS, "time"])
+    signal["t"] = pd.to_datetime(signal["time"])
     times = signal["t"].to_numpy(dtype="datetime64[ns]")
 
-    feed = pd.read_parquet(FEED_PATH, columns=["real time"])
-    feed_times = (
-        to_datetime(feed["real time"]).sort_values().reset_index(drop=True)
-    )
+    feed = pd.read_parquet(FEED_PATH, columns=["index", "time"])
+    peak_t = signal["t"].iloc[feed["index"].to_numpy()].reset_index(drop=True)
+    feed_labels = pd.to_datetime(feed["time"]).reset_index(drop=True)
+
+    channel_values = {}
+    for channel in CHANNELS:
+        values = minmax_channel(signal[channel].to_numpy())
+        channel_values[channel] = values
+        n_fail = show_smoothed_previews(channel, times, values, peak_t)
+        print(f"{channel}: {n_fail} windows without a mountain")
+
+    print("Close the figures after checking that each smoothed curve is fully marked.")
+    plt.show()
+
+    answer = input("Extract features for all channels? [y/n]: ").strip().lower()
+    if answer != "y":
+        print("Not extracted.")
+        return
 
     frames = []
     for channel in CHANNELS:
-        values = minmax_channel(signal[channel].to_numpy())
-        frames.append(extract_channel_rows(channel, times, values, feed_times))
-        save_curve_pngs(channel, times, values, feed_times, OUT_DIR)
+        values = channel_values[channel]
+        frames.append(
+            extract_channel_rows(channel, times, values, peak_t, feed_labels)
+        )
+        save_curve_pngs(channel, times, values, peak_t, OUT_DIR)
         print(channel, "features", len(frames[-1]))
 
     features = pd.concat(frames, ignore_index=True)
@@ -1062,10 +1187,16 @@ def main():
     features = features.sort_values(
         ["feeding_datetime", "channel"]
     ).reset_index(drop=True)
+    # Same columns as feeding_features_ein.py, including both plateau gradients.
+    # features_kept is this table again, so it is not a shorter analyzer selection.
     out = os.path.join(OUT_DIR, "features.parquet")
+    kept = os.path.join(OUT_DIR, "features_kept.parquet")
     features.to_parquet(out, index=False)
+    features.to_parquet(kept, index=False)
     print(features.shape)
+    print(list(features.columns))
     print(out)
+    print(kept)
 
 
 if __name__ == "__main__":

@@ -402,6 +402,7 @@ def main() -> None:
         k for k in period_summary.index if k.startswith("Local")
     ]
     bar_rows = named_intervals + local_event_intervals
+    
     plot_period_bars(period_summary.loc[bar_rows], DATA_DIR / "rolling3d_corr_periods.png")
 
     plot_series(values, slopes, DATA_DIR / "rolling3d_corr_series.png")
